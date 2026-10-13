@@ -1,0 +1,4 @@
+splitwise_cookies.txt
+*.cookies
+.venv/
+__pycache__/

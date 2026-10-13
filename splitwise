@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""splitwise — cookie-auth CLI for Splitwise (internal v3 API via web session).
+
+Cookies: ~/finance/splitwise_cookies.txt (name=value lines), or set
+SPLITWISE_COOKIE_FILE. Auth trick: the _splitwise_session cookie authenticates
+against https://secure.splitwise.com/api/v3.0/* directly — including
+get_main_data (precomputed balances) and writes, which the official OAuth API
+restricts.
+
+Commands:
+  me | groups | friends | balances
+  expenses [--group ID] [--limit N] [--details]
+  add --desc D --total T [--currency MYR] [--group ID | --with NAME[,NAME]]
+      [--split equal|shares --shares "Name=amt,..."] [--date YYYY-MM-DD] [--dry-run]
+  settle --with NAME --amount A [--group ID] [--date YYYY-MM-DD] [--dry-run]
+  delete EXPENSE_ID
+
+Balances rule: NEVER sum net_balance across expense rows (it is a per-expense
+delta, and group debts settle per-group). Read friends[]/groups[] balance
+arrays from get_main_data — server-computed, same payload the dashboard shows.
+"""
+import argparse, datetime, json, os, re, sys, urllib.parse, urllib.request
+
+BASE = "https://secure.splitwise.com/api/v3.0"
+COOKIE_FILE = os.path.expanduser(os.environ.get(
+    "SPLITWISE_COOKIE_FILE", "~/finance/splitwise_cookies.txt"))
+
+TODAY = datetime.date.today().isoformat()
+
+def load_cookies():
+    parts = []
+    with open(COOKIE_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                parts.append(line)
+    return "; ".join(parts)
+
+CK = load_cookies()
+
+def get_csrf():
+    r = urllib.request.Request("https://secure.splitwise.com/", headers={"Cookie": CK, "User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        html = resp.read().decode()
+    m = re.search(r'name="csrf-token" content="([^"]+)"', html)
+    if not m:
+        raise SystemExit("could not extract CSRF token (cookie expired?)")
+    return m.group(1)
+
+def req(path, params=None, method="GET", form=None, json_body=False):
+    url = BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    if form is not None and json_body:
+        data = json.dumps(form).encode()
+    else:
+        data = urllib.parse.urlencode(form).encode() if form else None
+    headers = {
+        "Cookie": CK,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+        "Accept": "application/json",
+    }
+    if form:
+        headers["X-CSRF-Token"] = get_csrf()
+        headers["Origin"] = "https://secure.splitwise.com"
+        headers["Referer"] = "https://secure.splitwise.com/"
+        headers["Content-Type"] = "application/json" if json_body else "application/x-www-form-urlencoded"
+    r = urllib.request.Request(url, data=data, method=method, headers=headers)
+    with urllib.request.urlopen(r, timeout=30) as resp:
+        body = resp.read().decode()
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        raise SystemExit(f"ERROR: non-JSON response from {path} (cookie expired?):\n{body[:200]}")
+
+def get_me():
+    d = req("/get_current_user")
+    return d["user"]
+
+def resolve_people():
+    """name(lower) -> id, including last names."""
+    m = {}
+    for f in req("/get_friends").get("friends", []):
+        for k in (f.get("first_name"), f.get("last_name"),
+                  (f.get("first_name") or "") + " " + (f.get("last_name") or "")):
+            if k:
+                m[k.strip().lower()] = f["id"]
+    # group members beyond friends
+    for g in req("/get_groups").get("groups", []):
+        gid = g["id"]
+        if gid == 0:
+            continue
+        for u in g.get("members", []) or []:
+            for k in (u.get("first_name"), (u.get("last_name") or "")):
+                if k:
+                    m.setdefault(k.strip().lower(), u["id"])
+    return m
+
+def find(res, name):
+    n = name.strip().lower()
+    if n in res:
+        return res[n], n
+    hits = {v: k for k, v in res.items() if k.startswith(n) or n in k}
+    if len(hits) == 1:
+        return list(hits.values())[0], list(hits.keys())[0]
+    if hits:
+        raise SystemExit(f"ambiguous name '{name}': {sorted(set(hits.keys()))}")
+    raise SystemExit(f"no Splitwise person matching '{name}'. Available: {sorted(set(res.values() and res.keys()))[:40]}")
+
+def fmt_expense(e, me_id):
+    shares = []
+    for u in e["users"]:
+        uid = u["user_id"]
+        nm = u["user"]["first_name"]
+        tag = "(you)" if uid == me_id else ""
+        shares.append(f"{nm}{tag} paid {u['paid_share']} owed {u['owed_share']}")
+    return (f"#{e['id']} [{e['date'][:10]}] {e['description']} — {e.get('total', e.get('cost', '?'))} {e['currency_code']}"
+            + (f" (group {e['group_id']})" if e.get("group_id") else " (friends)")
+            + "\n    " + "; ".join(shares))
+
+def cmd_me(_a):
+    u = get_me()
+    print(u["id"], u["first_name"], u.get("last_name") or "", "|", u.get("email", ""))
+
+def cmd_groups(_a):
+    for g in req("/get_groups")["groups"]:
+        print(g["id"], "—", g["name"])
+
+def cmd_friends(_a):
+    for f in req("/get_friends")["friends"]:
+        print(f["id"], f.get("first_name", ""), f.get("last_name") or "", f.get("email", ""))
+
+def cmd_balances(_a):
+    # TRUSTED SOURCE ONLY: precomputed balances from get_main_data (the same
+    # payload the Splitwise dashboard renders). Never sum net_balance across
+    # expenses — it's a per-expense delta and group expenses settle per-group.
+    d = req("/get_main_data")
+    rows = []
+    for f in d.get("friends", []):
+        nm = (f.get("first_name") or "?") + (" " + f["last_name"] if f.get("last_name") else "")
+        for b in f.get("balance") or []:
+            amt = float(b["amount"])
+            if abs(amt) < 0.005:
+                continue
+            rel = "owes YOU" if amt > 0 else "you owe"
+            rows.append((abs(amt), nm, rel, b["currency_code"]))
+    for g in d.get("groups", []):
+        for b in g.get("balance") or []:
+            amt = float(b["amount"])
+            if abs(amt) < 0.005:
+                continue
+            rel = "group owes YOU" if amt > 0 else "you owe group"
+            rows.append((abs(amt), g.get("name", f"group {g.get('id')}"), rel, b["currency_code"]))
+    for amt, label, rel, cur in sorted(rows, reverse=True):
+        print(f"{amt:10.2f} {cur}  {label:22s} {rel}")
+    if not rows:
+        print("all settled up")
+
+def cmd_expenses(a):
+    me = get_me()["id"]
+    params = {"limit": a.limit}
+    if a.group:
+        params["group_id"] = a.group
+    for e in req("/get_expenses", params).get("expenses", []):
+        print(fmt_expense(e, me) if a.details else
+              f"#{e['id']} [{e['date'][:10]}] {e['description']} — {e.get('total', e.get('cost', '?'))} {e['currency_code']}")
+
+def cmd_add(a):
+    me = get_me()["id"]
+    res = resolve_people()
+    if not a.group and not a.with_:
+        raise SystemExit("specify --group ID or --with Name[,Name]")
+    body = {
+        "description": a.desc,
+        "cost": f"{float(a.total):.2f}",
+        "currency_code": a.currency,
+        "date": (a.date + "T12:00:00Z") if len(a.date) == 10 else a.date,
+    }
+    if a.group:
+        body["group_id"] = a.group
+        if a.split == "equal":
+            body["split_equally"] = True
+        else:
+            g = req("/get_group", {"id": a.group}).get("group", {})
+            ids = [me] + [m["id"] for m in (g.get("members") or []) if m["id"] != me]
+            fill_shares(body, ids, a, res, me, float(a.total))
+    else:
+        body["group_id"] = 0
+        names = [n for n in a.with_.split(",") if n.strip()]
+        ids = [me] + [find(res, n)[0] for n in names]
+        if a.split == "equal":
+            # equal split without group: compute owed shares
+            n = len(ids)
+            per = round(float(a.total) / n, 2)
+            for i, uid in enumerate(ids):
+                body[f"users__{i}__user_id"] = uid
+                body[f"users__{i}__paid_share"] = f"{float(a.total):.2f}" if uid == me else "0.00"
+                body[f"users__{i}__owed_share"] = f"{per:.2f}"
+        else:
+            fill_shares(body, ids, a, res, me, float(a.total), payer=me)
+    if a.dry_run:
+        print(json.dumps(body, indent=1)); return
+    d = req("/create_expense", method="POST", form=body, json_body=True)
+    e = (d.get("expenses") or [{}])[0]
+    print("created", e.get("id"), "—", e.get("description"), e.get("cost"), e.get("currency_code"))
+
+def fill_shares(body, ids, a, res, me, total, payer=None):
+    """explicit per-person owed shares via users__i__paid/owed_share."""
+    share_map = {}
+    for pair in a.shares.split(","):
+        if not pair.strip():
+            continue
+        nm, amt = pair.split("=")
+        uid, label = find(res, nm.strip())
+        share_map[uid] = float(amt)
+    payer_id = payer if payer is not None else me
+    assigned = sum(share_map.values())
+    my_owed = round(total - assigned, 2)
+    for i, uid in enumerate(ids):
+        body[f"users__{i}__user_id"] = uid
+        owed = my_owed if uid == me else share_map.get(uid, 0.0)
+        body[f"users__{i}__owed_share"] = f"{owed:.2f}"
+        body[f"users__{i}__paid_share"] = f"{total:.2f}" if uid == payer_id else "0.00"
+
+def cmd_settle(a):
+    me = get_me()["id"]
+    res = resolve_people()
+    uid, label = find(res, a.with_)
+    body = {
+        "description": "Payment",
+        "cost": f"{float(a.amount):.2f}",
+        "currency_code": a.currency,
+        "date": (a.date + "T12:00:00Z") if len(a.date) == 10 else a.date,
+        "group_id": a.group if a.group else 0,
+        "payment": True,
+        "users__0__user_id": me,
+        "users__0__paid_share": f"{float(a.amount):.2f}",
+        "users__0__owed_share": "0.00",
+        "users__1__user_id": uid,
+        "users__1__paid_share": "0.00",
+        "users__1__owed_share": f"{float(a.amount):.2f}",
+    }
+    if a.dry_run:
+        print(json.dumps(body, indent=1)); return
+    d = req("/create_expense", method="POST", form=body, json_body=True)
+    e = (d.get("expenses") or [{}])[0]
+    print(f"payment of {a.amount} {a.currency} recorded with {label} (#{e.get('id')})")
+
+def cmd_delete(a):
+    d = req("/delete_expense", method="POST", form={"id": str(a.id)})
+    print("deleted" if d.get("success") else f"failed: {d}")
+
+def main():
+    p = argparse.ArgumentParser(prog="splitwise")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("me")
+    sub.add_parser("groups")
+    sub.add_parser("friends")
+    sub.add_parser("balances")
+    e = sub.add_parser("expenses"); e.add_argument("--group", type=int); e.add_argument("--limit", type=int, default=15); e.add_argument("--details", action="store_true")
+    a = sub.add_parser("add")
+    a.add_argument("--desc", required=True); a.add_argument("--total", required=True)
+    a.add_argument("--currency", default="MYR"); a.add_argument("--date", default=TODAY)
+    a.add_argument("--group", type=int); a.add_argument("--with", dest="with_")
+    a.add_argument("--split", choices=["equal", "shares"], default="equal")
+    a.add_argument("--shares", default="")
+    a.add_argument("--dry-run", action="store_true")
+    s = sub.add_parser("settle")
+    s.add_argument("--with", dest="with_", required=True); s.add_argument("--amount", required=True)
+    s.add_argument("--currency", default="MYR"); s.add_argument("--group", type=int)
+    s.add_argument("--date", default=TODAY)
+    s.add_argument("--dry-run", action="store_true")
+    dl = sub.add_parser("delete"); dl.add_argument("id", type=int)
+    args = p.parse_args()
+    if args.cmd == "delete":
+        cmd_delete(args); return
+    {"me": cmd_me, "groups": cmd_groups, "friends": cmd_friends, "balances": cmd_balances,
+     "expenses": cmd_expenses, "add": cmd_add, "settle": cmd_settle}[args.cmd](args)
+
+if __name__ == "__main__":
+    main()
