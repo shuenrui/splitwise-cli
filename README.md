@@ -43,7 +43,7 @@ splitwise settle --with Alice --amount 20 [--group ID] [--dry-run]
 splitwise delete EXPENSE_ID
 ```
 
-`add` defaults to you paying the full amount; `--split shares` takes explicit owed shares per person (remainder falls to you). `settle` records a payment (negative expense) so balances move.
+`add` defaults to you paying the full amount; `--split shares` takes explicit owed shares per person (remainder falls to you). Use `--paid-by Name` when the other person fronted the money (works with `--split shares`). `settle` records a payment (negative expense) so balances move.
 
 ## Balances: the one rule that matters
 

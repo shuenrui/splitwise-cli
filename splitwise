@@ -183,7 +183,7 @@ def cmd_add(a):
         else:
             g = req("/get_group", {"id": a.group}).get("group", {})
             ids = [me] + [m["id"] for m in (g.get("members") or []) if m["id"] != me]
-            fill_shares(body, ids, a, res, me, float(a.total))
+            fill_shares(body, ids, a, res, me, float(a.total), payer=(find(res, a.paid_by)[0] if a.paid_by else me))
     else:
         body["group_id"] = 0
         names = [n for n in a.with_.split(",") if n.strip()]
@@ -197,7 +197,7 @@ def cmd_add(a):
                 body[f"users__{i}__paid_share"] = f"{float(a.total):.2f}" if uid == me else "0.00"
                 body[f"users__{i}__owed_share"] = f"{per:.2f}"
         else:
-            fill_shares(body, ids, a, res, me, float(a.total), payer=me)
+            fill_shares(body, ids, a, res, me, float(a.total), payer=(find(res, a.paid_by)[0] if a.paid_by else me))
     if a.dry_run:
         print(json.dumps(body, indent=1)); return
     d = req("/create_expense", method="POST", form=body, json_body=True)
@@ -264,6 +264,7 @@ def main():
     a.add_argument("--group", type=int); a.add_argument("--with", dest="with_")
     a.add_argument("--split", choices=["equal", "shares"], default="equal")
     a.add_argument("--shares", default="")
+    a.add_argument("--paid-by", dest="paid_by", default="")
     a.add_argument("--dry-run", action="store_true")
     s = sub.add_parser("settle")
     s.add_argument("--with", dest="with_", required=True); s.add_argument("--amount", required=True)
